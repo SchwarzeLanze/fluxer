@@ -1,0 +1,513 @@
+# ============================================================================
+#  Fluxer — Coolify-optimised Docker Compose
+#  ---------------------------------------------------------------------------
+#  Unofficial community configuration. Fluxer itself belongs to the Fluxer
+#  team (https://github.com/fluxerapp/fluxer, AGPLv3).
+#
+#  This file is the upstream self-hosting stack with FIVE changes that make it
+#  deploy cleanly on Coolify behind Coolify's built-in Traefik proxy:
+#
+#    1. Caddy has NO host port bindings. Traefik already owns 80/443 on the
+#       host and reverse-proxies to Caddy internally. (Fixes the
+#       "Bind for 0.0.0.0:80 failed: port is already allocated" crash.)
+#    2. Caddyfile + livekit.yaml are provided as inline `configs:` instead of
+#       bind-mounted files. (Coolify recreates its service directory on every
+#       deploy and turns bind-mounted config files into empty directories,
+#       causing "not a directory" mount errors.)
+#    3. The Caddy site address is hard-coded to ":80" inside the Caddyfile.
+#       (The upstream "{$VAR}" placeholder gets mangled to ":80}" when embedded
+#       inline, producing "invalid port '80}'".)
+#    4. The seaweedfs-init container no longer hangs forever. `weed shell` does
+#       not exit on EOF in this image, so it is run in the background and
+#       stopped after the buckets are created — instead of blocking every
+#       dependent service (api, worker, admin, caddy, ...) indefinitely.
+#    5. Caddy explicitly joins Coolify's "coolify" proxy network (external),
+#       so Traefik can actually reach it. Without this you get "no available
+#       server" — and an implicitly-added network can silently disappear on a
+#       full redeploy, so it must be declared in the file.
+#
+#  IMPORTANT — set the domain on the Caddy service in Coolify as:
+#       https://YOUR.DOMAIN:80
+#  The "https://" makes Coolify generate the TLS router + Let's Encrypt; the
+#  ":80" tells Traefik which internal Caddy port to forward to. Without ":80"
+#  you get a 504 Gateway Timeout; with "http://" you get no HTTPS at all.
+#
+#  This file is Coolify-only. For plain Docker/Podman use compose.podman.yml.
+#  See README.md for the full deploy guide and the reasoning behind each fix.
+# ============================================================================
+
+x-fluxer-env: &fluxer-env
+  FLUXER_ENV: production
+  NODE_ENV: production
+  FLUXER_SELF_HOSTED: "true"
+  FLUXER_BASE_DOMAIN: ${FLUXER_DOMAIN:?set FLUXER_DOMAIN in .env}
+  FLUXER_PUBLIC_SCHEME: ${FLUXER_PUBLIC_SCHEME:-https}
+  FLUXER_PUBLIC_PORT: ${FLUXER_PUBLIC_PORT:-443}
+  FLUXER_TRUST_CLIENT_IP_HEADER: "true"
+  FLUXER_CLIENT_IP_HEADER_NAME: x-forwarded-for
+
+  FLUXER_DATABASE_BACKEND: postgres
+  FLUXER_POSTGRES_HOST: postgres
+  FLUXER_POSTGRES_PORT: "5432"
+  FLUXER_POSTGRES_DATABASE: fluxer
+  FLUXER_POSTGRES_USERNAME: fluxer
+  FLUXER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  FLUXER_POSTGRES_SSL: "false"
+
+  FLUXER_KV_URL: redis://valkey:6379/0
+  FLUXER_NATS_URL: nats://nats:4222
+  FLUXER_NATS_JETSTREAM_URL: nats://nats:4222
+  FLUXER_SVC_NATS_URL: nats://nats:4222
+  FLUXER_SVC_SHARD_COUNT: "1"
+
+  FLUXER_SEARCH_ENGINE: meilisearch
+  FLUXER_SEARCH_URL: http://meilisearch:7700
+  FLUXER_SEARCH_API_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
+
+  FLUXER_S3_ENDPOINT: http://seaweedfs:8333
+  FLUXER_S3_PUBLIC_ENDPOINT: http://seaweedfs:8333
+  FLUXER_S3_REGION: us-east-1
+  FLUXER_S3_ACCESS_KEY_ID: ${FLUXER_S3_ACCESS_KEY:?set FLUXER_S3_ACCESS_KEY in .env}
+  FLUXER_S3_SECRET_ACCESS_KEY: ${FLUXER_S3_SECRET_KEY:?set FLUXER_S3_SECRET_KEY in .env}
+  FLUXER_S3_FORCE_PATH_STYLE: "true"
+  FLUXER_S3_BUCKET_CDN: fluxer
+  FLUXER_S3_BUCKET_UPLOADS: fluxer-uploads
+  FLUXER_S3_BUCKET_DOWNLOADS: fluxer-downloads
+  FLUXER_S3_BUCKET_REPORTS: fluxer-reports
+  FLUXER_S3_BUCKET_HARVESTS: fluxer-harvests
+  AWS_ACCESS_KEY_ID: ${FLUXER_S3_ACCESS_KEY:?}
+  AWS_SECRET_ACCESS_KEY: ${FLUXER_S3_SECRET_KEY:?}
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_EC2_METADATA_DISABLED: "true"
+
+  FLUXER_LIVEKIT_ENABLED: "true"
+  FLUXER_LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}
+  FLUXER_LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}
+  FLUXER_LIVEKIT_WEBHOOK_URL: http://api:8080/webhooks/livekit
+
+  FLUXER_EMAIL_ENABLED: ${FLUXER_EMAIL_ENABLED:-false}
+  FLUXER_EMAIL_PROVIDER: ${FLUXER_EMAIL_PROVIDER:-none}
+  FLUXER_EMAIL_FROM_EMAIL: ${FLUXER_EMAIL_FROM_EMAIL:-noreply@localhost}
+  FLUXER_EMAIL_FROM_NAME: ${FLUXER_EMAIL_FROM_NAME:-Fluxer}
+  FLUXER_EMAIL_SMTP_HOST: ${FLUXER_EMAIL_SMTP_HOST:-}
+  FLUXER_EMAIL_SMTP_PORT: ${FLUXER_EMAIL_SMTP_PORT:-587}
+  FLUXER_EMAIL_SMTP_USERNAME: ${FLUXER_EMAIL_SMTP_USERNAME:-}
+  FLUXER_EMAIL_SMTP_PASSWORD: ${FLUXER_EMAIL_SMTP_PASSWORD:-}
+  FLUXER_EMAIL_SMTP_SECURE: ${FLUXER_EMAIL_SMTP_SECURE:-true}
+
+  FLUXER_SMS_ENABLED: "false"
+  FLUXER_CAPTCHA_ENABLED: ${FLUXER_CAPTCHA_ENABLED:-false}
+  FLUXER_CAPTCHA_PROVIDER: ${FLUXER_CAPTCHA_PROVIDER:-none}
+  FLUXER_STRIPE_ENABLED: "false"
+  FLUXER_NCMEC_ENABLED: "false"
+  FLUXER_CLAMAV_ENABLED: "false"
+  FLUXER_DISCOVERY_ENABLED: ${FLUXER_DISCOVERY_ENABLED:-true}
+
+  FLUXER_SUDO_MODE_SECRET: ${FLUXER_SUDO_MODE_SECRET:?set FLUXER_SUDO_MODE_SECRET in .env}
+  FLUXER_CONNECTION_INITIATION_SECRET: ${FLUXER_CONNECTION_INITIATION_SECRET:?set FLUXER_CONNECTION_INITIATION_SECRET in .env}
+  FLUXER_VAPID_PUBLIC_KEY: ${FLUXER_VAPID_PUBLIC_KEY:?set FLUXER_VAPID_PUBLIC_KEY in .env}
+  FLUXER_VAPID_PRIVATE_KEY: ${FLUXER_VAPID_PRIVATE_KEY:?set FLUXER_VAPID_PRIVATE_KEY in .env}
+  FLUXER_VAPID_EMAIL: ${FLUXER_VAPID_EMAIL:-admin@${FLUXER_DOMAIN}}
+  FLUXER_GATEWAY_RPC_AUTH_TOKEN: ${FLUXER_GATEWAY_RPC_AUTH_TOKEN:?set FLUXER_GATEWAY_RPC_AUTH_TOKEN in .env}
+  FLUXER_MEDIA_PROXY_SECRET_KEY: ${FLUXER_MEDIA_PROXY_SECRET_KEY:?set FLUXER_MEDIA_PROXY_SECRET_KEY in .env}
+  FLUXER_MEDIA_PROXY_UPLOAD_RELAY_SECRET_BASE64: ${FLUXER_MEDIA_PROXY_UPLOAD_RELAY_SECRET_BASE64:?set FLUXER_MEDIA_PROXY_UPLOAD_RELAY_SECRET_BASE64 in .env}
+  FLUXER_ADMIN_SECRET_KEY_BASE: ${FLUXER_ADMIN_SECRET_KEY_BASE:?set FLUXER_ADMIN_SECRET_KEY_BASE in .env}
+  FLUXER_ADMIN_OAUTH_CLIENT_SECRET: ${FLUXER_ADMIN_OAUTH_CLIENT_SECRET:?set FLUXER_ADMIN_OAUTH_CLIENT_SECRET in .env}
+
+  FLUXER_INTERNAL_API_ENDPOINT: http://api:8080
+  FLUXER_INTERNAL_GATEWAY_ENDPOINT: http://gateway:8080
+  FLUXER_INTERNAL_MEDIA_PROXY_ENDPOINT: http://media-proxy:8080
+  FLUXER_MARKETING_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}
+  FLUXER_MEDIA_PROXY_ENDPOINT: http://media-proxy:8080
+  FLUXER_MEDIA_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}/media
+  FLUXER_MEDIA_PROXY_UPLOAD_RELAY_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}/media
+
+x-fluxer-service: &fluxer-service
+  restart: unless-stopped
+  networks: [fluxer]
+
+services:
+  # --- Reverse proxy (INTERNAL ONLY) ----------------------------------------
+  # CHANGE #1 + #2 + #3 vs upstream:
+  #   - no `ports:`  -> Coolify's Traefik fronts this on the host
+  #   - Caddyfile via `configs:` -> no bind mount for Coolify to clobber
+  #   - site address ":80" is hard-coded in the config block below
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    # Caddy must join BOTH the internal fluxer network AND Coolify's proxy
+    # network, otherwise Traefik can't reach it -> "no available server".
+    networks:
+      - fluxer
+      - coolify
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [api, gateway, media-proxy, static-proxy, admin]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [fluxer]
+    environment:
+      POSTGRES_DB: fluxer
+      POSTGRES_USER: fluxer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluxer -d fluxer"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    restart: unless-stopped
+    networks: [fluxer]
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2.14-alpine
+    restart: unless-stopped
+    networks: [fluxer]
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    restart: unless-stopped
+    networks: [fluxer]
+    environment:
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
+    volumes:
+      - meilisearch-data:/meili_data
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.34
+    restart: unless-stopped
+    networks: [fluxer]
+    command: ["server", "-s3", "-dir=/data"]
+    volumes:
+      - seaweedfs-data:/data
+
+  # --- One-shot bucket creator ----------------------------------------------
+  # CHANGE #4 vs upstream: `weed shell` does not terminate on EOF in this
+  # image, so the upstream `echo ... | weed shell` blocks forever and every
+  # service that waits on `service_completed_successfully` never starts.
+  # Here we run it in the background, give it time to create the buckets, then
+  # stop it so the container can exit 0 on its own. No more manual killing.
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:4.34
+    networks: [fluxer]
+    depends_on: [seaweedfs]
+    restart: "no"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "Waiting for SeaweedFS to initialise..."
+        sleep 12
+        echo "Creating S3 buckets (weed shell is capped so it cannot hang the deploy)..."
+        printf 's3.bucket.create -name fluxer\ns3.bucket.create -name fluxer-uploads\ns3.bucket.create -name fluxer-downloads\ns3.bucket.create -name fluxer-reports\ns3.bucket.create -name fluxer-harvests\nexit\n' | weed shell -master=seaweedfs:9333 2>&1 &
+        WEED_PID=$$!
+        sleep 15
+        kill $$WEED_PID 2>/dev/null || true
+        echo "buckets ready"
+
+  # --- Voice / video (WebRTC) -----------------------------------------------
+  # CHANGE #2 vs upstream: livekit.yaml via `configs:` instead of a bind mount.
+  # The 7881/7882 ports stay published — WebRTC media needs a direct path and
+  # cannot go through Traefik. Open them in your provider firewall for voice.
+  livekit:
+    image: livekit/livekit-server:v1.12.0
+    restart: unless-stopped
+    networks: [fluxer]
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}"
+    configs:
+      - source: livekit_config
+        target: /etc/livekit.yaml
+    ports:
+      - "${FLUXER_LIVEKIT_TCP_PORT:-7881}:7881"
+      - "${FLUXER_LIVEKIT_UDP_PORT:-7882}:7882/udp"
+
+  api:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-api:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_API_PORT: "8080"
+      FLUXER_API_PRESIGNED_ATTACHMENT_UPLOADS_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/_health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    depends_on:
+      postgres: {condition: service_healthy}
+      valkey: {condition: service_healthy}
+      nats: {condition: service_started}
+      meilisearch: {condition: service_started}
+      seaweedfs-init: {condition: service_completed_successfully}
+      snowflakes: {condition: service_started}
+      snowflakes-shard: {condition: service_started}
+      messages: {condition: service_started}
+      messages-shard: {condition: service_started}
+      users: {condition: service_started}
+      users-shard: {condition: service_started}
+
+  worker:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-api:${FLUXER_IMAGE_TAG:-v1}
+    working_dir: /usr/src/app/fluxer_api
+    command: ["./node_modules/.bin/tsx", "src/WorkerEntrypoint.ts"]
+    environment:
+      <<: *fluxer-env
+      FLUXER_API_WORKER_MODE: all_lanes
+      FLUXER_API_WORKER_ENABLE_CRON_SCHEDULER: "true"
+      FLUXER_API_WORKER_ENABLE_VOICE_RECONCILIATION: "true"
+    depends_on:
+      postgres: {condition: service_healthy}
+      valkey: {condition: service_healthy}
+      nats: {condition: service_started}
+      seaweedfs-init: {condition: service_completed_successfully}
+      snowflakes-shard: {condition: service_started}
+      messages-shard: {condition: service_started}
+      users-shard: {condition: service_started}
+
+  gateway:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-gateway:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_GATEWAY_PORT: "8080"
+      FLUXER_GATEWAY_MEDIA_PROXY_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}/media
+      FLUXER_GATEWAY_STATIC_CDN_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}
+      FLUXER_GATEWAY_LOGGER_LEVEL: info
+    depends_on:
+      nats: {condition: service_started}
+      valkey: {condition: service_healthy}
+
+  media-proxy:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-media-proxy:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_MEDIA_PROXY_HOST: 0.0.0.0
+      FLUXER_MEDIA_PROXY_PORT: "8080"
+      FLUXER_MEDIA_PROXY_MODE: upload
+      FLUXER_MEDIA_PROXY_STORAGE_BACKEND: s3
+    healthcheck:
+      disable: true
+    depends_on:
+      seaweedfs-init: {condition: service_completed_successfully}
+      nats: {condition: service_started}
+
+  static-proxy:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-static:${FLUXER_IMAGE_TAG:-v1}
+
+  app-proxy:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-app-proxy-self-hosted:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      FLUXER_APP_PROXY_HOST: 0.0.0.0
+      FLUXER_APP_PROXY_PORT: "8080"
+      DISCOVERY_UPSTREAM_URL: http://caddy:8088/api/.well-known/fluxer
+      PUBLIC_BOOTSTRAP_API_ENDPOINT: /api
+      PUBLIC_BOOTSTRAP_API_PUBLIC_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}/api
+    depends_on:
+      api: {condition: service_healthy}
+      caddy: {condition: service_started}
+
+  snowflakes:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-snowflakes:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: router
+    depends_on:
+      nats: {condition: service_started}
+
+  snowflakes-shard:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-snowflakes:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: shard
+      FLUXER_SVC_SHARD_ID: "0"
+    depends_on:
+      nats: {condition: service_started}
+
+  users:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-users:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: router
+    depends_on:
+      nats: {condition: service_started}
+
+  users-shard:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-users:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: shard
+      FLUXER_SVC_SHARD_ID: "0"
+    depends_on:
+      nats: {condition: service_started}
+
+  messages:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-messages:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: router
+    depends_on:
+      nats: {condition: service_started}
+
+  messages-shard:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-messages:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: shard
+      FLUXER_SVC_SHARD_ID: "0"
+    depends_on:
+      nats: {condition: service_started}
+      postgres: {condition: service_healthy}
+
+  unfurl:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-unfurl:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: router
+    depends_on:
+      nats: {condition: service_started}
+
+  unfurl-shard:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-unfurl:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_SVC_MODE: shard
+      FLUXER_SVC_SHARD_ID: "0"
+    depends_on:
+      nats: {condition: service_started}
+
+  admin:
+    <<: *fluxer-service
+    image: ${FLUXER_REGISTRY:-ghcr.io/${FLUXER_REGISTRY_OWNER:-fluxerapp}}/fluxer-admin:${FLUXER_IMAGE_TAG:-v1}
+    environment:
+      <<: *fluxer-env
+      FLUXER_ADMIN_HOST: 0.0.0.0
+      FLUXER_ADMIN_PORT: "8080"
+      FLUXER_ADMIN_BASE_PATH: /admin
+      FLUXER_API_ENDPOINT: http://api:8080
+      FLUXER_ADMIN_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}/admin
+      FLUXER_APP_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}
+      FLUXER_MEDIA_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}/media
+      FLUXER_STATIC_CDN_ENDPOINT: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}
+      FLUXER_ADMIN_OAUTH_REDIRECT_URI: ${FLUXER_PUBLIC_SCHEME:-https}://${FLUXER_DOMAIN}/admin/oauth2_callback
+    depends_on:
+      api: {condition: service_healthy}
+
+networks:
+  fluxer:
+    driver: bridge
+  # Coolify's shared proxy network. It already exists (Coolify created it), so
+  # "external: true" means "attach to it, don't create it." This is what lets
+  # Traefik route to Caddy. On plain Docker this file won't start (the network
+  # is missing) — that's intentional; use compose.podman.yml there instead.
+  coolify:
+    external: true
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+  nats-data:
+  meilisearch-data:
+  seaweedfs-data:
+
+# ============================================================================
+#  Inline config files (CHANGE #2). Requires Docker Compose v2.23.1+ for the
+#  `content:` field — Coolify ships a recent enough version.
+# ============================================================================
+configs:
+  # Caddy listens on :80 INTERNALLY only. Coolify's Traefik terminates TLS and
+  # forwards here. The site address is hard-coded to :80 on purpose (CHANGE #3).
+  caddyfile:
+    content: |
+      :80 {
+          encode zstd gzip
+          handle_path /api/* {
+              reverse_proxy api:8080
+          }
+          handle /gateway {
+              rewrite * /
+              reverse_proxy gateway:8080
+          }
+          handle_path /gateway/* {
+              reverse_proxy gateway:8080
+          }
+          handle_path /media/* {
+              reverse_proxy media-proxy:8080
+          }
+          handle_path /livekit/* {
+              reverse_proxy livekit:7880
+          }
+          handle /admin {
+              rewrite * /
+              reverse_proxy admin:8080
+          }
+          handle_path /admin/* {
+              reverse_proxy admin:8080
+          }
+          @staticAssets path /fonts/* /web/* /emoji/* /libs/* /avatars/* /badges/* /desktop/* /embeds/*
+          handle @staticAssets {
+              reverse_proxy static-proxy:8080
+          }
+          handle {
+              reverse_proxy app-proxy:8080
+          }
+      }
+      :8088 {
+          handle_path /api/* {
+              reverse_proxy api:8080
+          }
+      }
+
+  # The webhook api_key must match one of the keys in LIVEKIT_KEYS above. It
+  # follows ${LIVEKIT_API_KEY} so changing the key stays consistent.
+  livekit_config:
+    content: |
+      port: 7880
+      log_level: info
+      rtc:
+        tcp_port: 7881
+        udp_port: 7882
+        use_external_ip: true
+        stun_servers:
+          - stun.l.google.com:19302
+          - stun1.l.google.com:19302
+      webhook:
+        api_key: ${LIVEKIT_API_KEY:-fluxer}
+        urls:
+          - http://api:8080/webhooks/livekit
